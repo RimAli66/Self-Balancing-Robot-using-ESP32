@@ -23,16 +23,16 @@ uint32_t lastMicros = 0;
 int16_t gyroBias = 0;
 
 // ======================= PID VARIABLES =======================
-double setpoint = 1;          // تم تعديلها إلى 1.2 كما في تجربتك
+double setpoint = 0.92;
 double Kp = 8.0;
-double Ki = 0.5;                // بدأت معها
-double Kd = 0.006;
+double Ki = 0.4;
+double Kd = 0.008;
 double error = 0;
 double prevError = 0;
 double integral = 0;
 double derivative = 0;
 double pidOutput = 0;
-double deadZone = 1.2;          // تم رفعها إلى 1.5 لتقليل الاهتزاز
+double deadZone = 1.2;          
 const double outputMax = 255.0;
 const double outputMin = -255.0;
 double currentDt = 0.005;
@@ -45,11 +45,12 @@ const double FALL_ANGLE = 45.0;
 const double HYSTERESIS = 2.0;
 bool fallen = false;
 
-// ======================= ESP-NOW COMMANDS (استقبال) =======================
+// ======================= ESP-NOW COMMANDS =======================
 #define CMD_STOP        1
 #define CMD_RUN         2
 #define CMD_SETPOINT    3
 #define CMD_MAXSPEED    4
+#define CMD_SET_DEADZONE 5   // أمر جديد للتحكم في deadZone
 
 typedef struct {
   float kp;
@@ -62,7 +63,7 @@ typedef struct {
   float value;
 } CommandMsg;
 
-// ======================= هيكل بيانات الإرسال (موسع بالكامل) =======================
+
 typedef struct {
   float angle;
   float error;
@@ -82,10 +83,10 @@ typedef struct {
 
 RobotStatus statusData;
 
-// ======================= عنوان MAC لجهاز التحكم =======================
-uint8_t controllerMac[] = {0x00, 0x4B, 0x12, 0x2C, 0xAE, 0x74}; // ⚠️ غيّره
 
-// ======================= دوال =======================
+uint8_t controllerMac[] = {0x00, 0x4B, 0x12, 0x2C, 0xAE, 0x74};
+
+// ======================= functions =======================
 void setupMPU();
 void calibrateGyroBias();
 bool updateAngle();
@@ -138,7 +139,6 @@ void loop() {
   }
 }
 
-// ======================= إرسال جميع البيانات =======================
 void sendStatus() {
   statusData.angle      = (float)correctedAngle;
   statusData.error      = (float)error;
@@ -158,7 +158,7 @@ void sendStatus() {
   esp_now_send(controllerMac, (uint8_t*)&statusData, sizeof(statusData));
 }
 
-// ======================= ESP-NOW RECEIVER =======================
+
 void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
   if (len == sizeof(PIDvalues)) {
     PIDvalues pid;
@@ -191,6 +191,10 @@ void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
         if (cmd.value >= 100 && cmd.value <= 8000)
           currentMaxSpeed = cmd.value;
         break;
+      case CMD_SET_DEADZONE:         
+        if (cmd.value >= 0.0 && cmd.value <= 10.0)
+          deadZone = cmd.value;
+        break;
     }
   }
 }
@@ -213,24 +217,34 @@ void computePID() {
 
   error = setpoint - correctedAngle;
 
+
   if (fabs(error) < deadZone) {
     pidOutput = 0;
     prevError = error;
     return;
   }
 
-  integral += Ki * error * dt;
-  if (integral > outputMax) integral = outputMax;
-  if (integral < outputMin) integral = outputMin;
-
-  derivative = Kd * (error - prevError) / dt;
+    derivative = Kd * (error - prevError) / dt;
   prevError = error;
 
-  pidOutput = Kp * error + integral + derivative;
+
+  double proportional = Kp * error;
+  double tempOutput = proportional + integral + derivative;
+
+  // ========== Anti-Windup ==========
+  if ((tempOutput >= outputMax && error > 0) || (tempOutput <= outputMin && error < 0)) {
+    pidOutput = tempOutput;
+  } else {
+
+    integral += Ki * error * dt;
+    if (integral > outputMax) integral = outputMax;
+    if (integral < outputMin) integral = outputMin;
+    pidOutput = proportional + integral + derivative;
+  }
+
   if (pidOutput > outputMax) pidOutput = outputMax;
   if (pidOutput < outputMin) pidOutput = outputMin;
 }
-
 // ======================= MOTOR CONTROL =======================
 void updateMotorControl() {
   if (correctedAngle > (FALL_ANGLE + HYSTERESIS) || correctedAngle < -(FALL_ANGLE + HYSTERESIS)) {
@@ -240,6 +254,7 @@ void updateMotorControl() {
       pidOutput = 0;
       integral = 0;
       prevError = 0;
+        currentSpeed = 0;   
     }
     setMotorSpeed(0);
     return;
@@ -250,6 +265,7 @@ void updateMotorControl() {
 
   if (!robotEnabled) {
     setMotorSpeed(0);
+      currentSpeed = 0; 
     return;
   }
 
@@ -268,7 +284,6 @@ void updateMotorControl() {
   setMotorSpeed(currentSpeed);
 }
 
-// ======================= دوال المحركات و MPU (بدون تغيير) =======================
 void setMotorSpeed(int stepsPerSecond) {
   if (stepsPerSecond == 0) {
     ledcWrite(stepPin1, 0);
