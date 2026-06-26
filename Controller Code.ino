@@ -1,13 +1,11 @@
 #include <esp_now.h>
 #include <WiFi.h>
 
-
 #define CMD_STOP        1
 #define CMD_RUN         2
 #define CMD_SETPOINT    3
 #define CMD_MAXSPEED    4
 #define CMD_SET_DEADZONE 5
-
 
 typedef struct {
   uint8_t cmd;
@@ -37,7 +35,7 @@ typedef struct {
   bool fallen;
 } RobotStatus;
 
-uint8_t robotMac[] = {0xB4, 0xBF, 0xE9, 0x09, 0xF0, 0x60};
+uint8_t robotMac[] = {0xB4, 0xBF, 0xE9, 0x09, 0xF0, 0x60}; 
 
 bool sendSuccess = false;
 
@@ -184,14 +182,24 @@ void loop() {
     }
 
     else if (input.startsWith("pid")) {
-      String rest = input.substring(3);
+      String rest = input.substring(3);   
       rest.trim();
+
+      
+      if (rest.startsWith(":")) {
+        rest = rest.substring(1);
+        rest.trim();
+      }
+
       int firstComma = rest.indexOf(',');
       int secondComma = rest.indexOf(',', firstComma + 1);
       if (firstComma != -1 && secondComma != -1) {
         String kpStr = rest.substring(0, firstComma);
         String kiStr = rest.substring(firstComma + 1, secondComma);
         String kdStr = rest.substring(secondComma + 1);
+
+        kpStr.trim(); kiStr.trim(); kdStr.trim(); 
+
         float kp = kpStr.toFloat();
         float ki = kiStr.toFloat();
         float kd = kdStr.toFloat();
@@ -213,3 +221,5 @@ void loop() {
     }
   }
 }
+double Ki = 0.15;
+double Kd = 0.06;
