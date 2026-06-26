@@ -106,7 +106,7 @@ typedef struct {
 RobotStatus statusData;
 
 // =======================  MAC ADDRES  =======================
-uint8_t controllerMac[] = {0x00, 0x4B, 0x12, 0x2C, 0xAE, 0x74}; // ⚠️ غيّره حسب جهازك
+uint8_t controllerMac[] = {0x00, 0x4B, 0x12, 0x2C, 0xAE, 0x74}; 
 
 // ======================= functions =======================
 void setupMPU();
@@ -251,7 +251,7 @@ void computePID() {
     return;
   }
 
-  // ===== تر Low-Pass =====
+  // =====  Low-Pass =====
   double rawDerivative = (error - prevError) / dt;
   filteredDerivative = derivativeAlpha * filteredDerivative + (1.0 - derivativeAlpha) * rawDerivative;
   derivative = Kd * filteredDerivative;
