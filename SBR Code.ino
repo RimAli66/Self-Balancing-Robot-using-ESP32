@@ -13,7 +13,7 @@ const int dirPin2  = 0;
 int stepChannel;
 const int resolutionBits = 1;
 int currentSpeed = 0;
-double currentMaxSpeed = 4000.0;
+double currentMaxSpeed = 3000.0;
 
 // ======================= MPU6050 + KALMAN =======================
 Kalman kalmanX;
@@ -24,18 +24,41 @@ int16_t gyroBias = 0;
 
 // ======================= PID VARIABLES =======================
 double setpoint = 0.92;
-double Kp = 8.0;
-double Ki = 0.4;
-double Kd = 0.008;
+
+
+// Kp: 8.0 -> 10-12   | Ki: 0.4 -> 0.1-0.2   | Kd: 0.008 -> 0.05-0.08
+double Kp = 9.5;
+double Ki = 0.15;
+double Kd = 0.06;
+
 double error = 0;
 double prevError = 0;
 double integral = 0;
 double derivative = 0;
 double pidOutput = 0;
-double deadZone = 1.2;          
+double deadZone = 1.2;
 const double outputMax = 255.0;
 const double outputMin = -255.0;
 double currentDt = 0.005;
+
+// --- (Derivative Low-Pass Filter) ---
+
+double derivativeAlpha = 0.75;
+double filteredDerivative = 0.0;
+
+
+double integralDecayInDeadzone = 0.95;
+
+// ======================= PID HARDWARE TIMER  =======================
+
+const uint64_t PID_PERIOD_US = 5000;          
+const double   PID_DT        = PID_PERIOD_US / 1000000.0;
+hw_timer_t *pidTimer = NULL;
+volatile bool pidFlag = false;
+
+void IRAM_ATTR onPIDTimer() {
+  pidFlag = true;   
+}
 
 // ======================= ROBOT STATE =======================
 bool robotEnabled = true;
@@ -45,12 +68,12 @@ const double FALL_ANGLE = 45.0;
 const double HYSTERESIS = 2.0;
 bool fallen = false;
 
-// ======================= ESP-NOW COMMANDS =======================
+// ======================= ESP-NOW COMMANDS  =======================
 #define CMD_STOP        1
 #define CMD_RUN         2
 #define CMD_SETPOINT    3
 #define CMD_MAXSPEED    4
-#define CMD_SET_DEADZONE 5   // أمر جديد للتحكم في deadZone
+#define CMD_SET_DEADZONE 5
 
 typedef struct {
   float kp;
@@ -62,7 +85,6 @@ typedef struct {
   uint8_t cmd;
   float value;
 } CommandMsg;
-
 
 typedef struct {
   float angle;
@@ -83,8 +105,8 @@ typedef struct {
 
 RobotStatus statusData;
 
-
-uint8_t controllerMac[] = {0x00, 0x4B, 0x12, 0x2C, 0xAE, 0x74};
+// =======================  MAC ADDRES  =======================
+uint8_t controllerMac[] = {0x00, 0x4B, 0x12, 0x2C, 0xAE, 0x74}; // ⚠️ غيّره حسب جهازك
 
 // ======================= functions =======================
 void setupMPU();
@@ -118,17 +140,21 @@ void setup() {
   peerInfo.channel = 0;
   peerInfo.encrypt = false;
   if (esp_now_add_peer(&peerInfo) != ESP_OK) while (1);
+
+  pidTimer = timerBegin(1000000);              
+  timerAttachInterrupt(pidTimer, &onPIDTimer);
+  timerAlarm(pidTimer, PID_PERIOD_US, true, 0); 
 }
 
 void loop() {
-  static unsigned long lastPIDtime = 0;
   static unsigned long lastSendTime = 0;
   unsigned long now = millis();
 
   if (updateAngle()) correctedAngle = kalAngleX;
 
-  if (now - lastPIDtime >= 5) {
-    lastPIDtime = now;
+  
+  if (pidFlag) {
+    pidFlag = false;
     computePID();
     updateMotorControl();
   }
@@ -139,6 +165,7 @@ void loop() {
   }
 }
 
+// ======================= Send all DATA  =======================
 void sendStatus() {
   statusData.angle      = (float)correctedAngle;
   statusData.error      = (float)error;
@@ -158,7 +185,7 @@ void sendStatus() {
   esp_now_send(controllerMac, (uint8_t*)&statusData, sizeof(statusData));
 }
 
-
+// ======================= ESP-NOW RECEIVER =======================
 void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
   if (len == sizeof(PIDvalues)) {
     PIDvalues pid;
@@ -166,9 +193,11 @@ void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
     Kp = pid.kp;
     Ki = pid.ki;
     Kd = pid.kd;
+
     integral = 0;
     prevError = 0;
     derivative = 0;
+    filteredDerivative = 0;   
     return;
   }
   else if (len == sizeof(CommandMsg)) {
@@ -191,7 +220,7 @@ void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
         if (cmd.value >= 100 && cmd.value <= 8000)
           currentMaxSpeed = cmd.value;
         break;
-      case CMD_SET_DEADZONE:         
+      case CMD_SET_DEADZONE:
         if (cmd.value >= 0.0 && cmd.value <= 10.0)
           deadZone = cmd.value;
         break;
@@ -199,43 +228,42 @@ void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
   }
 }
 
-// ======================= PID COMPUTATION =======================
+// ======================= PID COMPUTATION  =======================
 void computePID() {
-  static unsigned long lastTime = 0;
-  unsigned long now = millis();
-  double dt = (now - lastTime) / 1000.0;
-  if (dt <= 0.0) dt = 0.001;
-  lastTime = now;
-  currentDt = dt;
-
+ 
+  double dt = PID_DT;
+  currentDt = dt;   
   if (!robotEnabled || fallen) {
     pidOutput = 0;
     integral = 0;
     prevError = 0;
+    filteredDerivative = 0;
     return;
   }
 
   error = setpoint - correctedAngle;
 
-
+  // ===== DeadZone  =====
   if (fabs(error) < deadZone) {
     pidOutput = 0;
     prevError = error;
+    integral *= integralDecayInDeadzone;    
     return;
   }
 
-    derivative = Kd * (error - prevError) / dt;
+  // ===== تر Low-Pass =====
+  double rawDerivative = (error - prevError) / dt;
+  filteredDerivative = derivativeAlpha * filteredDerivative + (1.0 - derivativeAlpha) * rawDerivative;
+  derivative = Kd * filteredDerivative;
   prevError = error;
-
 
   double proportional = Kp * error;
   double tempOutput = proportional + integral + derivative;
 
-  // ========== Anti-Windup ==========
+  // ===== Anti-Windup =====
   if ((tempOutput >= outputMax && error > 0) || (tempOutput <= outputMin && error < 0)) {
-    pidOutput = tempOutput;
+    pidOutput = tempOutput;  
   } else {
-
     integral += Ki * error * dt;
     if (integral > outputMax) integral = outputMax;
     if (integral < outputMin) integral = outputMin;
@@ -245,6 +273,7 @@ void computePID() {
   if (pidOutput > outputMax) pidOutput = outputMax;
   if (pidOutput < outputMin) pidOutput = outputMin;
 }
+
 // ======================= MOTOR CONTROL =======================
 void updateMotorControl() {
   if (correctedAngle > (FALL_ANGLE + HYSTERESIS) || correctedAngle < -(FALL_ANGLE + HYSTERESIS)) {
@@ -254,7 +283,8 @@ void updateMotorControl() {
       pidOutput = 0;
       integral = 0;
       prevError = 0;
-        currentSpeed = 0;   
+      filteredDerivative = 0;
+      currentSpeed = 0;
     }
     setMotorSpeed(0);
     return;
@@ -265,7 +295,7 @@ void updateMotorControl() {
 
   if (!robotEnabled) {
     setMotorSpeed(0);
-      currentSpeed = 0; 
+    currentSpeed = 0;
     return;
   }
 
